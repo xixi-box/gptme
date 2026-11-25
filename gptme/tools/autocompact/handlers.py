@@ -9,7 +9,7 @@ from ...llm.models import get_default_model
 from ...message import Message, len_tokens
 from .config import _get_keep_head
 from .context_provider import CompressionConfig, get_context_provider
-from .decision import should_auto_compact
+from .decision import _default_compaction_limit, should_auto_compact
 from .events import append_compaction_event
 from .resume import _resume_via_llm
 
@@ -81,7 +81,10 @@ def cmd_compact_handler(ctx) -> Generator[Message, None, None]:
 def _compact_trim(ctx, msgs: list[Message]) -> Generator[Message, None, None]:
     """Rule-based compaction: strips reasoning, truncates massive tool results, compresses old assistant messages."""
 
-    decision = should_auto_compact(msgs, keep_head=_get_keep_head())
+    model = get_default_model()
+    limit = _default_compaction_limit(model) if model is not None else None
+    keep_head = _get_keep_head()
+    decision = should_auto_compact(msgs, limit=limit, keep_head=keep_head)
     if decision != "rule_based":
         if decision == "summarize":
             yield Message(
@@ -99,7 +102,9 @@ def _compact_trim(ctx, msgs: list[Message]) -> Generator[Message, None, None]:
     # Apply auto-compacting using the provider interface
     started = monotonic()
     provider = get_context_provider("default")
-    config = CompressionConfig(logdir=ctx.manager.logdir, keep_head=_get_keep_head())
+    config = CompressionConfig(
+        limit=limit, logdir=ctx.manager.logdir, keep_head=keep_head
+    )
     compacted_msgs = provider.compress(msgs, config).messages
 
     # Calculate reduction stats

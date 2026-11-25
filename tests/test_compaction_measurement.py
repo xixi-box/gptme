@@ -1,8 +1,23 @@
 """Provider usage must trigger compaction even when stored text undercounts it."""
 
+from pathlib import Path
+
+import pytest
+
+from gptme.llm.models import get_default_model, get_model
+from gptme.logmanager import LogManager
 from gptme.message import Message, len_tokens
+from gptme.tools.autocompact.context_provider import (
+    CompressionConfig,
+    DefaultContextProvider,
+)
 from gptme.tools.autocompact.decision import should_auto_compact
-from gptme.util.context_measurement import input_log_digest
+from gptme.tools.autocompact.hook import autocompact_hook
+from gptme.util.context_measurement import (
+    anchor_context_usage,
+    input_log_digest,
+    measure_context_tokens,
+)
 
 
 def test_provider_input_triggers_below_text_estimate():
@@ -23,6 +38,71 @@ def test_provider_input_triggers_below_text_estimate():
     messages = [*prefix, response]
     assert len_tokens(messages, "gpt-4") < 1000
     assert should_auto_compact(messages, limit=1000) == "summarize"
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    ["stale_output", "recent_output", "overhead_exceeds_limit", "stale_anchor"],
+)
+def test_provider_budget_for_tool_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str
+) -> None:
+    model = get_default_model() or get_model("gpt-4")
+    output = "\n".join(f"entry_{i} size={i * 13}" for i in range(1500))
+    prefix = [
+        Message("system", "Instructions"),
+        Message("user", "List entries"),
+        Message("assistant", "```shell\nls\n```"),
+        Message("system", output, call_id="call_1"),
+    ]
+    if scenario != "recent_output":
+        prefix.append(Message("user", "Now something else"))
+    stored_prefix = len_tokens(prefix, model.model)
+    limit = stored_prefix + 2000
+    overhead = limit if scenario == "overhead_exceeds_limit" else stored_prefix
+    response = Message(
+        "assistant",
+        "Done",
+        metadata={"usage": {"input_tokens": stored_prefix + overhead}},
+    )
+    anchor_context_usage(response, len(prefix), input_log_digest(prefix), model.full)
+    manager = LogManager(prefix, logdir=tmp_path / "conversation")
+    manager.append(response)
+    manager.append(Message("user", "One more thing"))
+    manager = LogManager.load(manager.logdir, lock=False)
+    messages = manager.log.messages
+    if scenario == "stale_anchor":
+        messages[0] = messages[0].replace(content="Updated instructions")
+
+    stored = len_tokens(messages, model.model)
+    measured = measure_context_tokens(messages, model.full)
+    assert stored < limit
+    if scenario == "stale_anchor":
+        assert measured == stored
+        assert should_auto_compact(messages, limit=limit) == "none"
+    else:
+        assert measured == stored + overhead > limit
+        expected = "summarize" if scenario == "overhead_exceeds_limit" else "rule_based"
+        assert should_auto_compact(messages, limit=limit) == expected
+
+    if scenario == "stale_anchor":
+        config = CompressionConfig(limit=limit, logdir=manager.logdir)
+        assert DefaultContextProvider().compress(messages, config).messages == messages
+    elif scenario != "overhead_exceeds_limit":
+        monkeypatch.setattr(
+            "gptme.tools.autocompact.hook.get_context_budget",
+            lambda *args, **kwargs: limit,
+        )
+        list(autocompact_hook(manager))
+        assert manager.current_view is not None
+        compacted = manager.log.messages
+        assert compacted[3].call_id == messages[3].call_id
+        assert compacted[3].content != messages[3].content
+        assert compacted[3].content.startswith("[Stale tool output pruned") == (
+            scenario == "stale_output"
+        )
+        assert len_tokens(compacted, model.model) + overhead < limit
+        assert measure_context_tokens(compacted, model.full) < measured
 
 
 def test_usage_plus_response_and_new_tool_result():

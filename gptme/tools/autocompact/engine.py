@@ -17,6 +17,10 @@ from pathlib import Path
 from ...context import strip_reasoning
 from ...llm.models import get_default_model, get_model
 from ...message import Message, len_tokens
+from ...util.context_measurement import (
+    estimate_context_text_tokens,
+    measure_context_tokens,
+)
 from ...util.master_context import (
     MessageByteRange,
     build_master_context_index,
@@ -78,7 +82,7 @@ def _is_tool_output(msg: Message, prev: Message | None) -> bool:
     system message immediately after an assistant tool-call. Other ``system``
     messages (agent instructions, knowledge files) must not be pruned.
     """
-    if msg.role != "system":
+    if msg.role != "system" or msg.ui_only:
         return False
     if msg.call_id:
         return True
@@ -394,9 +398,13 @@ def auto_compact_log(
     if limit is None:
         limit = int(0.8 * model.context)
 
-    # If we are below the configured limit and no safe projection applies, return as-is.
-    tokens = len_tokens(log, model=model.model)
+    tokens = estimate_context_text_tokens(log, model.model)
     initial_tokens = tokens  # preserved for final reduction_pct even after Phase 0
+    # Measure the source once. Editing the anchored prefix invalidates usage,
+    # but tool schemas and other provider overhead still occupy context.
+    measured_tokens = measure_context_tokens(log, model.full, text_model=model.model)
+    overhead = max(0, measured_tokens - tokens)
+    text_limit = limit - overhead
 
     # Phase 0: Relevance-scored pruning of stale tool outputs.
     # Only when already over budget — same gate as estimate_compaction_savings —
@@ -404,7 +412,7 @@ def auto_compact_log(
     # large, unreferenced tool outputs in place so tool-call pairing and
     # master-context indices stay valid. Surviving content is kept verbatim.
     phase0_tokens_saved = 0
-    if tokens >= limit:
+    if tokens >= text_limit:
         # Record keep/drop decisions before the live pass mutates the log.
         if logdir is not None:
             shadow_prune_stale_tool_outputs(
@@ -424,7 +432,7 @@ def auto_compact_log(
                 f"Phase 0 pruned {phase0_tokens_saved:,} tokens of stale tool outputs "
                 f"({len(log)} messages remaining)"
             )
-            tokens = len_tokens(log, model=model.model)
+            tokens = estimate_context_text_tokens(log, model.model)
 
     # Calculate message positions from end (for age-based reasoning stripping)
     log_length = len(log)
@@ -437,12 +445,13 @@ def auto_compact_log(
         and _has_reasoning_block(msg.content)
         for idx, msg in enumerate(log)
     )
-    needs_compacting = tokens >= limit
+    needs_compacting = tokens >= text_limit
 
     # Check if any messages need Phase 3 compression
     needs_phase3_compression = any(
         (log_length - idx - 1) >= 3  # Don't compress very recent messages
         and msg.role == "assistant"  # Only compress assistant responses
+        and not msg.ui_only
         and not message_contains_tool_use(msg)  # Keep tool-call pairs parseable
         and not _has_reasoning_block(msg.content)  # Never rewrite signed thinking
         and len_tokens(msg.content, model.model) > 1000  # Only compress long messages
@@ -464,7 +473,9 @@ def auto_compact_log(
         return
 
     if needs_compacting:
-        logger.info(f"Auto-compacting log: {tokens} tokens exceeds limit of {limit}")
+        logger.info(
+            f"Auto-compacting log: {tokens + overhead} tokens at or above limit {limit}"
+        )
     if needs_reasoning_strip:
         logger.info(
             f"Stripping reasoning from messages beyond threshold {reasoning_strip_age_threshold}"
@@ -502,16 +513,16 @@ def auto_compact_log(
     # This achieves target reduction with minimal information loss
     tool_result_tokens_saved = 0
     compression_tokens_saved = 0
-    current_tokens = len_tokens(compacted_log, model.model)
+    current_tokens = estimate_context_text_tokens(compacted_log, model.model)
     # Hysteresis: aim below the trigger so a successful trim leaves headroom.
     # target_ratio=1.0 keeps the pre-hysteresis behaviour for direct callers.
-    target_tokens = max(1, int(limit * target_ratio))
+    target_tokens = max(1, int(limit * target_ratio) - overhead)
 
     if current_tokens >= target_tokens:
         # Identify all candidate tool results for truncation (with original indices)
         candidates: list[tuple[int, int, Message]] = []  # (idx, tokens, msg)
         for idx, msg in enumerate(compacted_log):
-            if msg.pinned or idx < keep_head:
+            if msg.ui_only or msg.pinned or idx < keep_head:
                 continue
             if msg.role == "system":
                 msg_tokens = len_tokens(msg.content, model.model)
@@ -573,7 +584,7 @@ def auto_compact_log(
     # Phase 3: Extractive compression for long assistant messages
     compacted_log_len = len(compacted_log)
     for idx, msg in enumerate(compacted_log):
-        if msg.pinned or idx < keep_head:
+        if msg.ui_only or msg.pinned or idx < keep_head:
             continue
 
         distance_from_end = compacted_log_len - idx - 1
@@ -617,8 +628,8 @@ def auto_compact_log(
                     f"({compression_saved} saved, {(compression_saved / msg_tokens) * 100:.1f}% reduction)"
                 )
 
-    # Check if we're now within limits
-    final_tokens = len_tokens(compacted_log, model.model)
+    # Keep the existing stored-text limit for the destructive fallback.
+    final_tokens = estimate_context_text_tokens(compacted_log, model.model)
     total_saved = (
         phase0_tokens_saved
         + tool_result_tokens_saved

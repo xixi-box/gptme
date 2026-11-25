@@ -56,7 +56,14 @@ def anchor_context_usage(
         response.metadata["input_log_model"] = model
 
 
-def measure_context_tokens(messages: list[Message], model: str) -> int:
+def estimate_context_text_tokens(messages: list[Message], model: str) -> int:
+    """Count stored text that can appear in the provider context."""
+    return len_tokens([message for message in messages if not message.ui_only], model)
+
+
+def measure_context_tokens(
+    messages: list[Message], model: str, *, text_model: str | None = None
+) -> int:
     """Last valid provider input + estimated response/tail; text-only fallback.
 
     UsageData normalizes input_tokens to *uncached* input for every provider,
@@ -66,8 +73,10 @@ def measure_context_tokens(messages: list[Message], model: str) -> int:
     the anchored model identity additionally invalidates it on a model or
     provider change. Legacy logs without an anchor use the estimate until a new
     response arrives.
+
+    Use ``text_model`` when local text accounting uses a separate tokenizer name.
     """
-    visible = [message for message in messages if not message.ui_only]
+    text_model = text_model or model
     # Single-pass prefix digests: scanning candidate anchors must not
     # re-serialize the whole log per stale response (quadratic on edits).
     digests = prefix_digests(messages)
@@ -97,8 +106,8 @@ def measure_context_tokens(messages: list[Message], model: str) -> int:
         if total <= 0:
             continue
         tail = [message for message in messages[index:] if not message.ui_only]
-        return total + len_tokens(tail, model)
-    return len_tokens(visible, model)
+        return total + len_tokens(tail, text_model)
+    return estimate_context_text_tokens(messages, text_model)
 
 
 def last_provider_input_tokens(messages: list[Message], model: str) -> int | None:

@@ -1169,29 +1169,16 @@ def test_should_auto_compact_uses_budget_for_massive_tool_result_threshold():
     assert should_auto_compact(messages, limit=100_000) == "none"
 
 
-def test_auto_compact_trims_at_exact_budget(monkeypatch):
-    """Decision and engine use the same inclusive budget boundary.
+def test_auto_compact_trims_at_exact_budget() -> None:
+    """Decision and engine use the same inclusive budget boundary."""
+    model = get_default_model() or get_model("gpt-4")
+    messages = [Message("system", "tool output " * 3000)]
+    limit = len_tokens(messages, model.model)
 
-    Token counts must be mocked for every equivalent list, not just the
-    original ``messages`` object — the engine copies into ``compacted_log``.
-    """
-    messages = [Message("system", "tool output " * 100)]
-    from gptme.tools.autocompact import engine
-
-    def fake_len_tokens(value, model=None):
-        if isinstance(value, list):
-            return sum(fake_len_tokens(item, model) for item in value)
-        content = value.content if isinstance(value, Message) else value
-        if isinstance(content, str) and content.startswith("tool output"):
-            return 5000
-        return 50
-
-    monkeypatch.setattr(engine, "len_tokens", fake_len_tokens)
-
-    compacted = list(
-        auto_compact_log(messages, limit=5000, max_tool_result_tokens=2000)
-    )
-
+    assert should_auto_compact(messages, limit=limit + 1) == "none"
+    assert list(auto_compact_log(messages, limit=limit + 1)) == messages
+    assert should_auto_compact(messages, limit=limit) == "rule_based"
+    compacted = list(auto_compact_log(messages, limit=limit))
     assert compacted[0].content != messages[0].content
 
 

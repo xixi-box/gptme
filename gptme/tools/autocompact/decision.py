@@ -7,10 +7,13 @@ for triggering auto-compaction.
 import logging
 from typing import Literal
 
-from ...llm.models import get_default_model, get_model
+from ...llm.models import ModelMeta, get_default_model, get_model
 from ...message import Message, len_tokens
 from ...util.context_budget import get_context_budget
-from ...util.context_measurement import measure_context_tokens
+from ...util.context_measurement import (
+    estimate_context_text_tokens,
+    measure_context_tokens,
+)
 from ...util.reduce import message_contains_tool_use
 from .engine import _has_reasoning_block
 
@@ -33,6 +36,15 @@ REMINDER_RATIO = 0.9
 CompactAction = Literal["none", "rule_based", "summarize"]
 
 
+def _default_compaction_limit(model: ModelMeta) -> int:
+    return get_context_budget(
+        model.context,
+        max_output=model.max_output or 8192,
+        model_id=model.full,
+        model_context_budget=model.context_budget,
+    )
+
+
 def estimate_compaction_savings(
     log: list[Message],
     limit: int | None = None,
@@ -41,6 +53,8 @@ def estimate_compaction_savings(
     assistant_compression_age_threshold: int = 3,
     assistant_compression_min_tokens: int = 1000,
     keep_head: int = 0,
+    *,
+    measured_tokens: int | None = None,
 ) -> tuple[int, int, int]:
     """
     Estimate potential savings from auto-compaction without actually compacting.
@@ -52,9 +66,10 @@ def estimate_compaction_savings(
         reasoning_strip_age_threshold: Distance from end before stripping reasoning
         assistant_compression_age_threshold: Distance from end before compressing assistant messages
         assistant_compression_min_tokens: Minimum tokens for assistant message compression
+        measured_tokens: Provider-context estimate for this log and model, if already computed
 
     Returns:
-        Tuple of (total_tokens, estimated_savings, savings_from_reasoning)
+        Tuple of (visible stored-text tokens, estimated savings, savings from reasoning)
 
     This allows us to decide if compaction is worth the cost (cache invalidation)
     before actually triggering it.
@@ -67,18 +82,18 @@ def estimate_compaction_savings(
     """
 
     model = get_default_model() or get_model("gpt-4")
-    total_tokens = len_tokens(log, model.model)
+    total_tokens = estimate_context_text_tokens(log, model.model)
 
     if limit is None:
-        limit = get_context_budget(
-            model.context,
-            max_output=model.max_output or 8192,
-            model_id=model.full,
-            model_context_budget=model.context_budget,
+        limit = _default_compaction_limit(model)
+    if measured_tokens is None:
+        measured_tokens = measure_context_tokens(
+            log, model.full, text_model=model.model
         )
 
-    # The configured budget is the sole compaction trigger.
-    would_remove_tool_results = total_tokens >= limit
+    # Hold the provider overhead fixed while projecting edits to stored text.
+    text_limit = limit - max(0, measured_tokens - total_tokens)
+    would_remove_tool_results = total_tokens >= text_limit
 
     # Phase 0 runs first in auto_compact_log; estimate it on the original log
     # and run later-phase estimates on the stubbed log so we don't double-count
@@ -97,7 +112,9 @@ def estimate_compaction_savings(
         # Engine rechecks the budget after Phase 0 and skips Phase 2/3 when
         # stubbing already brought the log under limit. Match that here so we
         # don't count Phase 2 savings the engine would never take.
-        would_remove_tool_results = len_tokens(work_log, model.model) >= limit
+        would_remove_tool_results = (
+            estimate_context_text_tokens(work_log, model.model) >= text_limit
+        )
 
     log_length = len(work_log)
     estimated_tool_result_savings = 0
@@ -114,7 +131,7 @@ def estimate_compaction_savings(
         # be counted here. Otherwise the estimate can select ``rule_based`` for
         # savings the engine cannot realize, and the post-hoc savings gate then
         # rejects the view — leaving the log over budget until provider overflow.
-        if msg.pinned or idx < keep_head:
+        if msg.ui_only or msg.pinned or idx < keep_head:
             continue
 
         msg_tokens = len_tokens(msg.content, model.model)
@@ -170,20 +187,15 @@ def should_auto_compact(
         "none" if no compaction is needed.
 
     Auto-compacting is triggered when the conversation reaches the resolved budget.
-    Rule-based compaction is selected only when estimated savings exceed
-    ``MIN_SAVINGS_RATIO``; otherwise the LLM summarizer handles the same trigger.
+    Rule-based compaction requires meaningful savings and, when provider usage
+    adds overhead, enough savings to fit the budget with that overhead.
     """
 
     model = get_default_model() or get_model("gpt-4")
     if limit is None:
-        limit = get_context_budget(
-            model.context,
-            max_output=model.max_output or 8192,
-            model_id=model.full,
-            model_context_budget=model.context_budget,
-        )
+        limit = _default_compaction_limit(model)
 
-    total_tokens = measure_context_tokens(log, model.full)
+    total_tokens = measure_context_tokens(log, model.full, text_model=model.model)
 
     # One budget means one trigger: no separate provider-window fraction.
     would_trigger = total_tokens >= limit
@@ -193,7 +205,7 @@ def should_auto_compact(
 
     # Second check: estimate if savings would be worth it
     total, estimated_savings, reasoning_savings = estimate_compaction_savings(
-        log, limit, keep_head=keep_head
+        log, limit, keep_head=keep_head, measured_tokens=total_tokens
     )
     # Compare trim savings against the stored-text total the engine will
     # actually shrink, not the larger provider-reported count: a trim saving
@@ -207,6 +219,10 @@ def should_auto_compact(
             f"({estimated_savings} tokens) below threshold {MIN_SAVINGS_RATIO:.0%}. "
             f"Will use LLM-powered summarization instead."
         )
+        return "summarize"
+
+    if total_tokens > total and total_tokens - estimated_savings >= limit:
+        logger.info("Estimated trim savings leave provider context at or over budget")
         return "summarize"
 
     logger.debug(
